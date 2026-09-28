@@ -64,6 +64,27 @@
   ```
   比 `os.remove` 的报错更早、更干净地给出定性结论（`os.remove` 会被本机 safe-delete 拦截并抛出 trash-failed，掩盖真实原因）。
 - **文件"未被占用"≠"可删除"**：本机实测 `qingnse64.dll`（15.3MB）已无任何进程加载（`CreateFileW` 独占打开成功），但 `os.remove` 仍被 safe-delete 拦下、`os.rename` 报 `WinError 5 拒绝访问`。**占用与权限是两个独立问题，必须分开验证**，否则会反复重试同一条走不通的路。
+- **最终根因是 pending-delete，不是权限也不是占用**（2026-09-28 实测，此前两次误判）：
+  - 症状：提权后 `rd /s /q` 仍返回 `RESULT=FAIL`；提权进程里 `os.open(..., O_RDWR)` 报 `PermissionError(13)`，而 `os.rename` 却**成功**。
+  - 定性证据：`icacls <残留目录>` 显示 `BUILTIN\Administrators:(I)(F)` —— **权限本不是障碍**，把方向从"继续提权"纠正过来。
+  - 真正原因：`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager` 的 `PendingFileRenameOperations` 里有一条
+    `*1\??\C:\Program Files (x86)\...\12.1.0.21915\office6\qingnse64.dll`。
+    `*1` 前缀 = 已登记"**重启后删除**"，文件处于 pending-delete 态：打开被拒、删除被拒、**提权无效**，但重命名仍可能成功。这是 WPS 覆盖安装/清理程序登记后尚未执行的结果。
+  - 处置：**直接重启一次，系统会自行删除该文件（零风险、零操作，优先选这条）**；若不便重启，则先清除该条登记再提权删除（动 HKLM，需先向用户确认）。
+  - 教训：排查顺序应为 **权限（icacls / 写探针）→ 占用（rename 探针 + 模块枚举）→ pending-delete（注册表）**。只查前两层时，结论会一直指向"再提权一次"，但那条路永远走不通。
+- **重启实际释放量比单个残留文件更多**（2026-09-28 用 `scripts/check_pending_delete.py` 全量盘点）：`PendingFileRenameOperations` 共 40 组登记，其中 12 组目标仍存在、28 组早已处理过。**去重后重启可释放约 39.19 MB**，构成是：
+
+  | 项 | 体积 | 说明 |
+  |---|---|---|
+  | `12.1.0.28505\office6\etmain.dll_d_6ab9fe83` | 18.02 MB | **新装版本目录里**的待删副本（文件名 `_d_<hex>` 是 WPS 安装器的待删标记），不影响使用 |
+  | `12.1.0.21915\office6\qingnse64.dll` | 15.27 MB | 本次争议的那一个 |
+  | `C:\Program Files (x86)\Microsoft\Edge\Temp` | 5.17 MB | 含 `old_msedge.exe`，Edge 自更新遗留 |
+  | `C:\Windows\System32\drivers\SET*.tmp` ×2 | 0.50 MB | 驱动安装遗留 |
+  | `%TEMP%\~$K48D9.tmp` 等 | 0.24 MB | Office 临时锁文件 |
+
+  即：**pending-delete 清单是全局共享的，不只 WPS 在用**。遇到"某个文件删不掉"时顺手盘点整份清单，往往能一并发现其他可随重启回收的空间。
+- **解析 `\??\` 前缀的坑**（自查踩过）：清单一律形如 `*1\??\C:\...`，写脚本核对目标是否存在时**必须先剥掉 `\??\`**。直接 `os.path.exists('\\??\\C:\\...')` 会静默返回 `False`，得到"所有待删项目标都消失"的错误结论，看起来像是清单已失效——实际相反。
+- **探测占用者的正确姿势**：`Get-Process | %{ $_.Modules }` 匹配路径**必须在提权下运行**，普通权限读其他进程模块会抛 AccessDenied 被静默吞掉（表现为"无任何进程占用"）。且结果要与 `os.rename` 交叉验证——本次枚举报 `explorer` / `OneDrive` 持有该 DLL，但 rename 成功，证明并非真实映射，不能据此让用户去关进程。
 - 安装过程会解包到 `%TEMP%\nsc*.tmp`（NSIS 插件：`AccessControl.dll`/`System.dll`/`v6svc_oem.dll`）与 `%TEMP%\wps\~<id>\CONTROL\`（Qt 界面，`kpacketui.dll`），安装完成后应清理。
 - 覆盖安装完成后根目录的 `wpsupdate.exe` 被移除，仅保留 `ksolaunch.exe`。
 

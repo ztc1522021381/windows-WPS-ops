@@ -20,7 +20,14 @@ agent_created: true
    ```
 4. **Git Bash 会把 `/xxx` 形式的开关改写成本地路径**。例如 `/wait` 被转成 `C:/Users/<user>/.workbuddy/binaries/PortableGit/versions/1.2.0/wait`，导致 `start` 报"Windows 找不到文件"，并弹出误导性错误框。所有斜杠开关写成双斜杠：`//c`、`//wait`、`//S`。以 `-` 开头的参数不受影响。
 5. **GUI 程序与长任务必须 `run_in_background=true`**。前台命令结束时，它拉起的进程树会被回收——表现为界面正常弹出、命令返回后立刻消失。
-6. **提权只能由用户完成**。清单为 `requireAdministrator` 的程序无法由 Agent 静默提权；UAC 弹窗**等待 120 秒后自动超时＝视为拒绝**，症状是进程存活约 2 分钟后以退出码 1 + "拒绝访问"结束。判断方法：`consent.exe` 常驻即 UAC 正在等待；UAC 运行在安全桌面，普通程序枚举不到它的窗口。启动后必须**立刻提醒用户点「是」，不要等待**。
+6. **提权只能由用户完成，但可以由 Agent 主动发起 UAC**。`requireAdministrator` 的程序无法被静默提权；UAC 弹窗**等待 120 秒后自动超时＝视为拒绝**，症状是进程存活约 2 分钟后以退出码 1 + "拒绝访问"结束。判断方法：`consent.exe` 常驻即 UAC 正在等待；UAC 运行在安全桌面，普通程序枚举不到它的窗口。启动后必须**立刻提醒用户点「是」，不要等待**。
+   - **已验证可用的提权发起方式**（2026-08-28 实测，比 `Start-Process -Verb RunAs` 更可靠）：
+     ```python
+     import ctypes
+     r = ctypes.windll.shell32.ShellExecuteW(None, 'runas', exe_path, args, None, 0)
+     print(r)   # >32 = 已成功拉起提权进程；<=32 = 失败（5/1223 常见于用户取消 UAC）
+     ```
+     配套要点：① 提权进程是**独立进程**，Agent 拿不到它的 stdout，必须让被调脚本把结果**重定向到临时文件**，主进程 `sleep` 若干秒后回读；② 别用 `-Verb RunAs` 之外的 GUI 包装，直接调 `ShellExecuteW` 最稳；③ 提权前的沙箱外权限（`dangerouslyDisableSandbox`）是**必要条件但不等于提权**——沙箱外跑仍会 `IsUserAnAdmin() == False`。
 7. **命令正文里出现某些敏感字样会被安全过滤器整条拦下**。过滤器扫描的是**整条命令字符串**，不只命令本身——把长文本内联在命令里很容易踩雷。实测：一条 `git commit -m "…不依赖 PowerShell 输出…"` 被拒，理由是「Invoking PowerShell from Bash bypasses security checks; use the PowerShell tool instead」，尽管命令里根本没有调用它。
    - 应对：**长文本一律写入临时文件再引用**，不要让正文进入命令行。
      ```
@@ -77,6 +84,26 @@ winget show <PackageId> --source winget --accept-source-agreements --disable-int
   ```
   这比直接 `os.remove` 更早给出定性结论——`os.remove` 会先被 `safe-delete` 拦下并抛 `trash-failed`，**把真实的权限原因掩盖掉**。
 - **"文件未被占用"与"文件可删除"是两件事**，必须分开验证。实测某 DLL 已无任何进程加载（`CreateFileW` 独占打开成功），但 `os.remove` 仍被拦、`os.rename` 报 `WinError 5 拒绝访问`——若只验证了占用，就会反复重试同一条走不通的路。
+- **提权后仍然删不掉 → 立刻查 `PendingFileRenameOperations`**（2026-08-28 实测，这是最容易被漏掉的一层）。该注册表值位于 `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager`，条目为**成对字符串**：带 `*1` 前缀表示"重启后删除"，`*2` 前缀表示"重启后重命名"。文件被登记后处于 pending-delete 态：**打开会报 `PermissionError`、删除被拒，且提权无效**——但 `os.rename` 往往仍能成功，这个矛盾组合正是判定特征。
+  - **快捷方式**：直接跑 `scripts/check_pending_delete.py`（只读），它会列清单、区分"仍存在"与"已被处理过"、去重算出重启实际可释放多少。
+  - **解析坑（务必注意）**：注册表里存的是 NT 路径 `\??\C:\...`，**必须剥掉 `\??\` 前缀再交给 `os.path`**，否则 `os.path.exists()` 会对**所有**条目一律返回 `False`，得到"目标全都不存在"的全面误报——这个 bug 我自己就踩过一次。
+  - **不要按条目数估空间**：实测 40 组登记里只有 12 组目标仍然存在，其余 28 组早已被处理过，重启时不会有任何动作。且父目录与其子项会重复计数，统计必须去重。
+  ```python
+  import winreg
+  k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                     r'SYSTEM\CurrentControlSet\Control\Session Manager')
+  v, _ = winreg.QueryValueEx(k, 'PendingFileRenameOperations')
+  print([x for x in v if '<关键字>' in str(x)])
+  ```
+  两个出口：**① 直接重启，系统会自动删掉（零风险，优先推荐）**；② 清除该条登记后再提权删除（要动 HKLM，属需向用户确认的操作）。
+- **判定"谁占用了文件"用进程模块枚举，提权下才可用**（普通权限访问其他进程的 `Modules` 会抛 AccessDenied 被静默吞掉）：
+  ```powershell
+  Get-Process | ForEach-Object { $p=$_; try { $p.Modules |
+    Where-Object { $_.FileName -like '*<特征串>*' } |
+    ForEach-Object { "$($p.ProcessName) PID=$($p.Id) :: $($_.FileName)" } } catch {} }
+  ```
+  注意：该结果与 `os.rename` 是否成功要**交叉验证**——若 rename 成功，说明并无真实映射，模块枚举结果可能是陈旧或误报，不要据此让用户先关进程。
+- **ACL 用 `icacls <目录>` 一次看清**。若 `BUILTIN\Administrators:(I)(F)` 存在，说明**权限不是障碍**，此时删不掉必然是占用或 pending-delete，别再往提权方向使劲。
 - 覆盖安装通常会清空旧版本目录内容但**留下空壳**（个别被占用的 DLL 残留），残留量一般几十 MB，可接受。
 
 ## 六、汇报要求
@@ -107,3 +134,4 @@ winget show <PackageId> --source winget --accept-source-agreements --disable-int
 
 - `references/wps-office-repair.md` —— WPS Office "功能模块异常 / 点击即提示重新加载" 的完整诊断与修复案例，含根因模式、官方命令、覆盖安装流程。
 - `scripts/parallel_download.py` —— 分片并发下载 + SHA256 校验脚本，命令行传 URL / 输出路径 / 期望哈希 / 线程数。
+- `scripts/check_pending_delete.py` —— **只读**核查 `PendingFileRenameOperations` 登记清单：列出全部"重启后删除/重命名"项、区分"目标仍存在"与"已被处理过"、去重统计重启实际可释放空间。删文件反复失败时先跑它排除 pending-delete。支持 `--json` / `--grep <关键字>`。
