@@ -1,6 +1,6 @@
 ---
 name: windows-agent-ops
-description: 在 Windows + WorkBuddy 沙箱环境下对桌面软件做诊断、下载、安装、提权、进程与注册表核查时的操作规范与避坑清单。当任务涉及在本机执行 exe 或安装程序、读写注册表、启动 GUI 程序、下载大文件、或排查桌面软件故障（如 WPS/Office 类应用报错）时使用。
+description: 在 Windows + WorkBuddy 沙箱环境下对桌面软件做诊断、下载、安装、提权、进程与注册表核查，以及发起 HTTP 请求、处理代理、捕获脚本输出与文件落盘时的操作规范与避坑清单。当任务涉及在本机执行 exe 或安装程序、读写注册表、启动 GUI 程序、下载大文件、调用网络 API、采集脚本运行结果、或排查桌面软件故障（如 WPS/Office 类应用报错）时使用。
 agent_created: true
 ---
 
@@ -61,11 +61,47 @@ winget show <PackageId> --source winget --accept-source-agreements --disable-int
 
 - `safe-delete`（走回收站的删除机制）对 `Program Files` 下的目录会失败并返回 `SAFE_DELETE_FAIL_CLOSED`；不要因此改用 `shutil.rmtree` 硬删受保护目录，改用应用自带的清理命令或让用户以管理员身份处理。
 - 被运行中进程占用的文件删不掉属正常，应用自带的清理常返回 `retry later` 并在下次启动重试——不要反复硬删。
+- **但"应用自带的清理命令"往往自己也不带提权**，不能无条件当作最终手段。实测 WPS 的 `ksomisc.exe -clearOldVersions` 以普通用户身份运行（日志固定打印 `isCanRunElevated Failed ... not needAdmin`），在只给 `Administrators` 写权限的目录上**每次调用都必然失败**。
+- **日志说"已清理"不等于真清理了。** 同一次调用里既打印 `delete failed, retry later` 又打印 `all old versions cleared` 是可能的——后一句是**假信号**，它重置重试标记、等于永久放弃。**必须回到磁盘列举目录来复核**，不要用日志结论代替。
+- **判定"删不掉"到底是占用还是权限**：在目标目录里做一次**写探针**（尝试创建并删除一个临时文件）。
+  ```python
+  import os, uuid, ctypes
+  d = r'<目标目录>'
+  try:
+      t = os.path.join(d, 'wtest_%s.tmp' % uuid.uuid4().hex[:8])
+      open(t, 'w').close(); os.remove(t)
+      print('有写权限 -> 权限不是障碍')
+  except PermissionError:
+      print('无写权限 -> 必须提权')
+  print('当前进程管理员:', bool(ctypes.windll.shell32.IsUserAnAdmin()))
+  ```
+  这比直接 `os.remove` 更早给出定性结论——`os.remove` 会先被 `safe-delete` 拦下并抛 `trash-failed`，**把真实的权限原因掩盖掉**。
+- **"文件未被占用"与"文件可删除"是两件事**，必须分开验证。实测某 DLL 已无任何进程加载（`CreateFileW` 独占打开成功），但 `os.remove` 仍被拦、`os.rename` 报 `WinError 5 拒绝访问`——若只验证了占用，就会反复重试同一条走不通的路。
 - 覆盖安装通常会清空旧版本目录内容但**留下空壳**（个别被占用的 DLL 残留），残留量一般几十 MB，可接受。
 
 ## 六、汇报要求
 
 向用户汇报时给出**前后对照表**（版本、目录占用、注册表关键值、磁盘可用空间），明确区分"已验证"与"仅推断"，并列出仍需用户实测的项。涉及提权的步骤必须写清"需要你点哪一下、点慢会怎样"。
+
+## 七、网络、代理与输出捕获
+
+### 出站请求
+
+- **`curl -o <路径>` 会被沙箱静默拦下**：命令返回成功、文件却不生成。此前只用 `-o /dev/null`（例如测 HTTP 状态码）时不会暴露这个问题。**需要把响应落盘时改用 Python `urllib`**，写完后再读一次确认真实字节数。
+- **不同域名的可达性不一致，不要用一次失败否定整条链路。** 实测同一会话内 `github.com` 与 `api.github.com` 均返回 200，而 `raw.githubusercontent.com` 读取超时。遇到超时先区分「某个域名不通」与「整体断网」，并**优先改用稳定端点**（例如取文件内容用 `api.github.com` 的 contents 端点，而不是 raw 端点）。
+- 代理由环境变量注入（`http_proxy` / `https_proxy`）。Python `urllib` 默认读取这些变量，无需手工配置；不认环境变量的库需显式传参。
+- HTTP 出站一律**带重试**（退避 3～4 次）。单次超时是常态，不是故障信号，不要因此改写逻辑或放弃任务。
+
+### 路径与临时文件
+
+- **Git Bash 的 `/tmp` 与 Windows 原生程序不互通**：把 `/tmp/x` 交给 Python 或 curl 会得到 `No such file or directory`——两侧对 `/` 的解析规则不同。**一律使用 Windows 原生临时路径**（如 `C:/Users/<user>/AppData/Local/Temp/...`），无论调用方是 bash 还是原生程序。
+- 写入 `D:`、`E:`、`F:` 等其他盘时同样用原生格式 `D:/xxx`，不要用 `/d/xxx`（git-bash 会误解析，产物可能落到 `C:\d\`）。
+
+### 输出捕获
+
+- **长脚本的 stdout 可能整体丢失**：进程被回收或收到 SIGTERM 时，缓冲区里的输出一并消失，表现为「退出码非 0、无任何输出」，极易被误判成脚本逻辑错误而去改代码。
+- 应对：**关键结果落盘到文件再读回**，不要只依赖 stdout。长任务把进度即时追加写入日志文件（每步 flush），中断后仍能判断执行到哪一步。
+- 需要实时观测时，把命令放到后台运行并单独收集输出，而不是写成一长串前台管道。
 
 ## 参考资源
 
