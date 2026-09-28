@@ -1,6 +1,6 @@
 ---
 name: windows-agent-ops
-description: 在 Windows + WorkBuddy 沙箱环境下对桌面软件做诊断、下载、安装、提权、进程与注册表核查，以及发起 HTTP 请求、处理代理、捕获脚本输出与文件落盘时的操作规范与避坑清单。当任务涉及在本机执行 exe 或安装程序、读写注册表、启动 GUI 程序、下载大文件、调用网络 API、采集脚本运行结果、或排查桌面软件故障（如 WPS/Office 类应用报错）时使用。
+description: 在 Windows + WorkBuddy 沙箱环境下对桌面软件做诊断、下载、安装、提权、进程与注册表核查、编译部署，以及发起 HTTP 请求、处理代理、捕获脚本输出、文件落盘、替换被运行中进程锁定的产物时的操作规范与避坑清单。当任务涉及在本机执行 exe 或安装程序、读写注册表、启动 GUI 程序、下载大文件、调用网络 API、采集脚本运行结果、编译或部署本机程序、验证 MCP stdio 服务、排查桌面软件故障（如 WPS/Office 类应用报错）时使用。
 agent_created: true
 ---
 
@@ -130,8 +130,75 @@ winget show <PackageId> --source winget --accept-source-agreements --disable-int
 - 应对：**关键结果落盘到文件再读回**，不要只依赖 stdout。长任务把进度即时追加写入日志文件（每步 flush），中断后仍能判断执行到哪一步。
 - 需要实时观测时，把命令放到后台运行并单独收集输出，而不是写成一长串前台管道。
 
+## 八、编译与部署：产物被运行中进程占用时
+
+本机常见场景：要修的程序**正在运行**（例如它被某个 IDE / Agent 客户端作为 MCP 服务拉起），此时重新编译会失败在**拷贝阶段**，而不是编译阶段。
+
+### 1. 先分清"编译失败"与"拷贝失败"
+
+`dotnet build` 报 `MSB3027 / MSB3021 ... because it is being used by another process` 属于后者：**C# 代码本身已经编译通过**。这类报错的重试日志可以刷到 200 KB 以上，先别慌——搜 `error CS` 有没有命中，没有就说明源码没问题，问题只在产物落地。
+
+### 2. 报错信息里的 PID 是免费情报
+
+报错原文自带**进程名与 PID**（形如 `文件被"XxxBridge (13828)"锁定`）。据此可直接反推：**是哪个客户端把这个目录的产物当服务在跑**，往往比翻配置文件更快。
+
+### 3. 绕开锁定：编译到独立目录
+
+```
+dotnet build -c Release --no-restore -p:BaseOutputPath=D:/build-verify/bin/
+```
+
+只改最终拷贝目录，`obj/` 里的中间产物不受影响，因此**不需要重新 restore**。用于先拿一份干净产物做比对 / 校验。
+
+### 4. 零中断替换：重命名法
+
+**Windows 允许重命名已被加载的 DLL / exe**（句柄绑定文件对象，重命名只改目录项，删除才会被拒）。所以不必先杀进程：
+
+1. `os.rename(旧文件, 旧文件 + ".old-<日期>")`
+2. 复制新文件到原路径
+3. 正在运行的进程**继续跑旧代码、毫无影响**；客户端下次重连才加载新代码
+
+- 实测（2026-09-28）：对正被进程加载的 DLL 重命名成功并还原。
+- **必须先按 MD5 比对新旧目录，只替换内容真正不同的文件**——依赖包通常逐字节一致，实测 41 个产物里只有 3 个需要替换。
+- **重命名后要立刻放回同名文件**，否则客户端恰好在这几毫秒内重启会启动失败。
+- 现成脚本：`scripts/replace_locked_files.py`（支持 `--dry-run` / `--apply` / `--rollback`）。
+
+### 5. 由进程反推客户端配置
+
+```python
+import ctypes, ctypes.wintypes as w
+k = ctypes.windll.kernel32
+h = k.OpenProcess(0x1000, False, PID)          # PROCESS_QUERY_LIMITED_INFORMATION
+buf = ctypes.create_unicode_buffer(2048); size = w.DWORD(2048)
+k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+print(buf.value)    # 映像完整路径
+```
+
+- 父进程用 `CreateToolhelp32Snapshot(0x2, 0)` + `Process32FirstW/NextW` 读 `PROCESSENTRY32W` 的 `th32ParentProcessID`，再反查父进程名——**父进程名往往直接就是客户端身份**。
+- **不要在 Bash 里调 `powershell.exe` 查进程**：会被安全策略整条拒绝（`Invoking PowerShell from Bash bypasses security checks`）。Python `ctypes` 最稳。
+- **`tasklist` 的结果可能与编译器的锁定报告互相矛盾**（实测 `tasklist | grep` 找不到该进程，编译器却明确报它锁着文件）。**以能解释现象的那个证据为准**，不要因为一个工具没看到就否定结论。
+
+### 6. .NET 环境与包目录隔离
+
+- 本机可能只装了 Runtime 而无 SDK（`dotnet --version` 报 `No .NET SDKs were found`）。下载 **SDK 的 zip 包解压即用**即可：免管理员、不污染系统，符合"C 盘紧张、软件装 D/F 盘"的约定。
+- **把 NuGet 全局包目录移出 C 盘**：命令前加 `NUGET_PACKAGES=D:/nuget-packages`。只作用于该次进程，**不改任何全局配置文件**（改全局属需向用户确认的操作）。
+- 跨机器复制来的项目若 restore 报包路径错误，检查 `obj/project.assets.json` 里的 `packageFolders`——它记录的是**原作者机器的绝对路径**，删掉 `obj/` 重新 restore 即可。
+- **强制全新编译**用 `--no-incremental`。增量编译在"源码没变"时会跳过编译只做拷贝，于是**一条 warning 都不报**，容易被误判成"编译很干净"。
+
+### 7. 部署后验证 MCP stdio 服务
+
+被 IDE / Agent 客户端拉起的 MCP 服务是 stdio 上的 JSON-RPC，可以自己拉起来做**零副作用**冒烟测试：`initialize` → `notifications/initialized` → `tools/list`。
+
+- 用 `subprocess.Popen` 起进程，**用线程收集 stdout 行，按 JSON-RPC `id` 匹配响应**（不要按行号——日志和通知会掺进 stdout）。
+- 只做 `initialize` + `tools/list` 不会触达任何业务副作用。
+- **调用具体工具前必须先逐个评估副作用**：凡是会动键盘 / 剪贴板 / 鼠标的工具，在另一个自动化客户端可能正在操作同一目标时**绝对不要**贸然调用——两个进程同时发 Ctrl+A / Ctrl+C / 粘贴，可能把对方未保存的内容写坏。若目标程序里有未保存改动（窗口标题常带 `*`），更要一律回避。
+- 想验证错误路径，**传一个不存在的对象名**是最安全的做法（能证明"明确报错"而非"静默返回垃圾"）。
+- 现成脚本：`scripts/mcp_stdio_smoke.py`。
+
 ## 参考资源
 
 - `references/wps-office-repair.md` —— WPS Office "功能模块异常 / 点击即提示重新加载" 的完整诊断与修复案例，含根因模式、官方命令、覆盖安装流程。
 - `scripts/parallel_download.py` —— 分片并发下载 + SHA256 校验脚本，命令行传 URL / 输出路径 / 期望哈希 / 线程数。
 - `scripts/check_pending_delete.py` —— **只读**核查 `PendingFileRenameOperations` 登记清单：列出全部"重启后删除/重命名"项、区分"目标仍存在"与"已被处理过"、去重统计重启实际可释放空间。删文件反复失败时先跑它排除 pending-delete。支持 `--json` / `--grep <关键字>`。
+- `scripts/replace_locked_files.py` —— **零中断替换**被运行中进程占用的产物：先按 MD5 比对新旧目录只挑出真正变化的文件，再用"重命名旧文件 + 复制新文件"的方式落地，无需终止进程；支持 `--dry-run` / `--apply` / `--rollback`。
+- `scripts/mcp_stdio_smoke.py` —— MCP stdio 服务冒烟测试：拉起服务进程走 handshake 并列出工具清单，默认零业务副作用；可选 `--call` 调用单个工具（需自行评估副作用）。

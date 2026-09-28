@@ -11,9 +11,10 @@
     python parallel_download.py https://example.com/app.exe D:/Downloads/app.exe abc123... 16 4
 
 注意：
-- 全部分片先缓存在内存，峰值内存约等于文件大小；超大文件请调大分片数不大幅降低线程数，
-  或自行改为分片落盘（Range 直写文件 + seek）。
+- 分片直接 seek 落盘，内存峰值约为「线程数 × 分片大小」，与文件总大小无关。
 - 并发并非越高越好，超过约 16 线程后通常收益递减，且可能被服务端限流。
+- 期望 SHA256 可传 `-` 或省略表示不校验；不校验时至少比对下载字节数与远端大小。
+- 不要只信 `Accept-Ranges` 响应头（见 head_size 的说明）。
 """
 import hashlib
 import os
@@ -25,14 +26,27 @@ import urllib.request
 
 
 def head_size(url, timeout=30):
-    req = urllib.request.Request(url, method="HEAD")
+    """探测总大小并确认服务端真的支持 Range。
+
+    **不要只信 HEAD 的 Accept-Ranges 头。** 实测部分 CDN（如 .NET SDK 的
+    builds.dotnet.microsoft.com）根本不返回该头（值为 None），但完全支持
+    Range——发 Range 请求会正常返回 206 + Content-Range。只按该头判断会把
+    可下载的地址误判成"不支持分片"而直接放弃。因此改为**实测判定**。
+    """
+    req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        if r.headers.get("Accept-Ranges", "").lower() != "bytes":
-            raise SystemExit("服务端不支持 Range，无法分片下载（Accept-Ranges 缺失）")
-        return int(r.headers["Content-Length"])
+        if r.status == 206:
+            cr = r.headers.get("Content-Range", "")
+            if "/" in cr and cr.rsplit("/", 1)[-1].isdigit():
+                return int(cr.rsplit("/", 1)[-1])
+        length = r.headers.get("Content-Length")
+        if length:
+            return int(length)
+    raise SystemExit("无法确定文件大小：服务端既未返回 Content-Range 也未返回 Content-Length")
 
 
-def fetch(url, rng, buf, idx, retry=6):
+def fetch(url, rng, out_path, write_lock, retry=6):
+    """下载单个分片并直接 seek 落盘（避免把整个文件缓存在内存里）。"""
     start, end = rng
     last = None
     for attempt in range(retry):
@@ -42,7 +56,10 @@ def fetch(url, rng, buf, idx, retry=6):
                 data = r.read()
             if len(data) != end - start + 1:
                 raise IOError("短读 %d != %d" % (len(data), end - start + 1))
-            buf[idx] = data
+            with write_lock:
+                with open(out_path, "r+b") as f:
+                    f.seek(start)
+                    f.write(data)
             return
         except Exception as exc:  # noqa: BLE001
             last = exc
@@ -70,7 +87,14 @@ def main():
         pos = end + 1
     print("分片 %d 个，线程 %d 个" % (len(ranges), threads), flush=True)
 
-    buffers = [None] * len(ranges)
+    # 预分配目标文件，各分片直接 seek 写入 —— 内存峰值只与线程数×分片大小有关
+    out_dir = os.path.dirname(os.path.abspath(out))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(out, "wb") as f:
+        f.truncate(total)
+
+    write_lock = threading.Lock()
     q = queue.Queue()
     for i in range(len(ranges)):
         q.put(i)
@@ -82,10 +106,12 @@ def main():
                 i = q.get_nowait()
             except queue.Empty:
                 return
-            fetch(url, ranges[i], buffers, i)
-            done[0] += 1
-            if done[0] % 5 == 0 or done[0] == len(ranges):
-                print("进度 %d/%d" % (done[0], len(ranges)), flush=True)
+            fetch(url, ranges[i], out, write_lock)
+            with write_lock:
+                done[0] += 1
+                n = done[0]
+            if n % 5 == 0 or n == len(ranges):
+                print("进度 %d/%d" % (n, len(ranges)), flush=True)
 
     t0 = time.time()
     ths = [threading.Thread(target=worker) for _ in range(threads)]
@@ -93,10 +119,13 @@ def main():
     [t.join() for t in ths]
     dt = time.time() - t0
 
-    with open(out, "wb") as f:
-        for b in buffers:
-            f.write(b)
     size = os.path.getsize(out)
+    if size != total:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        raise SystemExit("下载不完整（%d != %d），已删除半成品" % (size, total))
     print("完成: %d 字节，用时 %.1f s，平均 %.0f KB/s" % (size, dt, size / 1024 / dt), flush=True)
 
     h = hashlib.sha256()

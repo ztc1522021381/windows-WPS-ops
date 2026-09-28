@@ -1,6 +1,6 @@
 # windows-agent-ops
 
-> 在 Windows 沙箱环境下执行桌面软件诊断、下载、安装、提权、进程与注册表核查时的 Agent 操作规范与避坑清单。
+> 在 Windows 沙箱环境下执行桌面软件诊断、下载、安装、提权、进程与注册表核查、编译部署时的 Agent 操作规范与避坑清单。
 
 **What is this?** An [Agent Skill](https://docs.claude.com/en/docs/claude-code/skills) that documents a set of non-obvious constraints in a sandboxed Windows agent environment, plus a fully worked case study: diagnosing and repairing WPS Office's "功能模块异常 / 点击即提示重新加载" failure without blindly reinstalling.
 
@@ -31,7 +31,9 @@
 │   └── wps-office-repair.md          # 案例：WPS Office「功能模块异常」完整修复过程
 └── scripts/
     ├── parallel_download.py          # 分片并发下载 + SHA256 校验
-    └── check_pending_delete.py       # 只读：核查「重启后删除/重命名」登记清单
+    ├── check_pending_delete.py       # 只读：核查「重启后删除/重命名」登记清单
+    ├── replace_locked_files.py       # 零中断替换被运行中进程占用的产物
+    └── mcp_stdio_smoke.py            # MCP stdio 服务冒烟测试（默认零副作用）
 ```
 
 ## 七条硬规则（摘要）
@@ -59,6 +61,10 @@
 - **删除与权限** —— 应用自带的清理命令**自身往往不带提权**，在 ACL 受限目录上必然失败；而且它打印的「已全部清理」可能是**假信号**。判定该用「写探针」而不是直接删。
 - **文件未被占用 ≠ 可删除** —— 占用与权限是两个独立问题，必须分开验证。
 - **还有第三层：pending-delete** —— 文件若已被登记进 `PendingFileRenameOperations`，则处于「待重启删除」态：打开报 `PermissionError`、删除被拒、**提权也无效**，但重命名仍可能成功。这个矛盾组合就是判定特征。排查顺序应为 **权限 → 占用 → 待删登记**；只查前两层会永远卡在「再提权一次」。`scripts/check_pending_delete.py` 可一键核查。
+- **编译产物被运行中进程占用** —— `dotnet build` 报 `MSB3027 / MSB3021 ... being used by another process`，属于**拷贝阶段失败，而非编译失败**（搜 `error CS` 为空即可确认，这类重试日志能刷到 200 KB 以上）。用 `-p:BaseOutputPath=<独立目录>` 编译到别处，就能先拿到一份干净产物做比对。
+- **零中断替换被占用的产物** —— Windows 允许**重命名**已被加载的 DLL / exe（删除才会被拒）。因此「重命名旧文件 + 复制新文件」可以在**不终止进程**的前提下完成更新：正在运行的程序继续跑内存里的旧代码，客户端下次重连才加载新代码。替换前先按 MD5 比对新旧目录，**只挑真正变化的文件**——实测 41 个产物里只有 3 个不同，其余依赖逐字节一致。`scripts/replace_locked_files.py` 提供 `--dry-run` / `--apply` / `--rollback`。
+- **由进程反推客户端配置** —— 取映像路径与父进程名（`QueryFullProcessImageNameW` + `CreateToolhelp32Snapshot`）往往比翻配置文件更快锁定「是谁把这个目录的产物当服务在跑」，父进程名常常就直接是客户端身份。注意 `tasklist` 的结果可能与编译器的锁定报告**互相矛盾**（实测 `tasklist` 找不到该进程、编译器却明确报它锁着文件），以能解释现象的那个证据为准。
+- **部署后验证 MCP stdio 服务** —— 自己拉起进程走 `initialize` + `tools/list` 即可完成零副作用冒烟测试。**调用具体工具前必须先评估副作用**：会动键盘 / 剪贴板 / 鼠标的工具，在另一个自动化客户端可能正在操作同一目标时绝对不要贸然调用——两边同时发按键，可能把对方未保存的内容写坏。`scripts/mcp_stdio_smoke.py` 支持该流程。
 
 ## 案例亮点
 
