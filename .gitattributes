@@ -1,0 +1,16 @@
+# 统一使用 LF，避免 Windows 下 CRLF 污染
+* text=auto eol=lf
+
+# 明确二进制类型
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.exe binary
+*.dll binary
+
+# 语言统计与 diff 行为
+*.md diff=markdown
+*.py diff=python

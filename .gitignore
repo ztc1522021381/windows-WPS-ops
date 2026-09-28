@@ -1,0 +1,28 @@
+# Agent / IDE
+.workbuddy/
+.claude/
+.cursor/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# 下载与临时产物（脚本的常规输出目录）
+Downloads/
+*.tmp
+*.part
+*.download
+
+# Windows
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
