@@ -1,6 +1,6 @@
 ---
 name: windows-agent-ops
-description: 在 Windows + WorkBuddy 沙箱环境下对桌面软件做诊断、下载、安装、提权、进程与注册表核查、编译部署，以及发起 HTTP 请求、处理代理、捕获脚本输出、文件落盘、替换被运行中进程锁定的产物时的操作规范与避坑清单。当任务涉及在本机执行 exe 或安装程序、读写注册表、启动 GUI 程序、下载大文件、调用网络 API、采集脚本运行结果、编译或部署本机程序、验证 MCP stdio 服务、排查桌面软件故障（如 WPS/Office 类应用报错）时使用。
+description: 在 Windows + WorkBuddy 沙箱环境下对桌面软件做诊断、下载、安装、提权、进程与注册表核查、编译部署、网页自动化，以及发起 HTTP 请求、处理代理、捕获脚本输出、文件落盘、替换被运行中进程锁定的产物时的操作规范与避坑清单。当任务涉及在本机执行 exe 或安装程序、静默安装大型 IDE（如 Visual Studio）、读写注册表、启动 GUI 程序、下载大文件、调用网络 API、采集脚本运行结果、编译或部署本机程序、验证 MCP stdio 服务、用浏览器截图或抓取网页（无 Playwright/Puppeteer 时走 Edge + CDP）、排查桌面软件故障（如 WPS/Office 类应用报错、MSI "源缺失"弹窗）时使用。
 agent_created: true
 ---
 
@@ -106,6 +106,94 @@ winget show <PackageId> --source winget --accept-source-agreements --disable-int
 - **ACL 用 `icacls <目录>` 一次看清**。若 `BUILTIN\Administrators:(I)(F)` 存在，说明**权限不是障碍**，此时删不掉必然是占用或 pending-delete，别再往提权方向使劲。
 - 覆盖安装通常会清空旧版本目录内容但**留下空壳**（个别被占用的 DLL 残留），残留量一般几十 MB，可接受。
 
+### 回收站：删除被转入回收站引发的连锁误判（2026-09-28 实测）
+
+- **`shutil.rmtree` / `os.remove` 删除的大目录也会进回收站**，表现为"源目录确实消失了，但磁盘可用空间纹丝不动"。删完必须核对 free space，**不能只看目录是否还在**。本任务迁移 2.04 GB 用户数据时即如此，空间一直没释放。
+- **解析 `$I` 元数据的两个坑**：
+  1. 路径长度字段是 **UTF-16 字符数**，读字节要 `×2`；不乘会得到被截断的路径（如 `C:\Users\15220\App`），据此做关键词匹配必然漏判。
+  2. **配对 `$R` 的名字不能靠"原名后缀"拼**。Windows 通常给 `$R` 保留扩展名，但对 **`.vscode` 这类以点开头的名字**可能不追加扩展名，于是 `$R` + `原名后缀` 找不到文件、`os.path.exists()` 返回 False，代码会静默跳过真正占空间的那一项而只删掉 `$I` —— 数据块变成"看不见的孤儿占用"。**正确做法是用 `$I`/`$R` 的 6 位 ID 前缀做配对**，不要拼扩展名。
+- **精确清理单项**：用 `SHFileOperationW`（`wFunc=3` 即 `FO_DELETE`，**不带 `FOF_ALLOWUNDO`**）永久删除 `$R`，再删配对的 `$I`。直接用 `os.remove`/`rmtree` 有再次进回收站的风险。
+- 清完再跑一次"孤儿 `$R` 扫描"复核：`$I` 数量应 ≥ `$R` 数量，且不存在"有 `$R` 无 `$I`"的项。
+
+### 批量删除的 50 项确认门槛 —— 清理必须设计成两步（2026-09-28 实测）
+
+- **`safe-delete` 对单个文件也生效。** 判定实验（最干净，比删目录快且数值分毫不差）：造一个 200 KB 文件 → `os.remove` → 观察回收站。实测结果：**不抛异常、文件消失、C 盘回收站精确 +200000 B / +1 项**。**凡在磁盘上"删除文件"，默认都只是搬进回收站。**
+- **批量删除另有硬门槛**：单次会话（turn）内删除累计达 **50 项**后，后续删除被拒绝，并输出：
+  ```
+  [safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":50,"threshold":50,"scope":"turn","targets":[...]}
+  ```
+  该消息由删除函数**打印到 stdout 后继续执行**（不抛异常）——脚本会"看起来正常跑完却什么都没删"。**删除脚本必须扫描 stdout 是否含 `SAFE_DELETE`**，否则静默空跑。
+- **结论：任何清理都是两步**，第二步只能由用户完成：
+  1. Agent 执行删除 → 数据进回收站，**磁盘可用空间不释放**；
+  2. **请用户右键回收站图标 →「清空回收站」**（Windows 原生，不经过任何 hook，几秒完成）。
+  汇报时务必讲清这一点，别让用户以为"删了就等于空间回来了"。
+- **衡量成果只看 free space，绝不看目录是否消失**：本次清理中 Temp 从 6.25 GB 降到 3.3 GB，C 盘可用却纹丝不动；直到用户清空回收站，C 盘才从 **15.45 GB 跳到 25.37 GB**。
+- 别为此写"分批小量删除"来绕门槛——那是规避安全机制。正确做法是把清空回收站这一步交给用户。
+
+### 批量清理脚本的编写规范（2026-09-28 实测）
+
+**① `winreg.DeleteKey` 不能删非空键 —— 递归删除的两个必踩陷阱**
+
+```python
+def del_tree(root, path):
+    k = winreg.OpenKey(root, path, 0, winreg.KEY_ALL_ACCESS)
+    def rec(key, depth):
+        if depth > 15: return
+        i = 0
+        while True:
+            try: sub = winreg.EnumKey(key, i)
+            except OSError: break
+            try:
+                sk = winreg.OpenKey(key, sub, 0, winreg.KEY_ALL_ACCESS)
+            except OSError:
+                i += 1                      # 打不开 → 必须前进
+                continue
+            rec(sk, depth + 1)              # 先清空子孙
+            winreg.CloseKey(sk)
+            try:
+                winreg.DeleteKey(key, sub)  # 再删子键本身
+            except OSError:
+                i += 1                      # 删不掉 → 必须前进
+    rec(k, 0)
+    winreg.CloseKey(k)
+    winreg.DeleteKey(root, path)            # 最后删自己
+```
+
+- **陷阱一**：`winreg.DeleteKey` **不允许删除含子键的键**，抛 `PermissionError`（WinError 5）。**只递归遍历却不删除子键 = 什么都没删**，表现为"报表说已删除、注册表里原样还在"。
+- **陷阱二**：删除失败时**必须** `i += 1`。否则 `EnumKey(key, 0)` 永远返回同一个键名 → **死循环**（实测卡住并占满一个 CPU 核）。
+- **先删子键再删父键**的顺序不能反；`rec` 返回后才 `DeleteKey`。
+
+**② 提权子进程的三条硬约束**
+
+| 做法 | 实测结果 |
+|---|---|
+| `ShellExecuteW(runas, ..., show=1)` 可见控制台 | **提权进程根本不启动**（无日志、无产物、无进程） |
+| `ShellExecuteW(runas, ..., show=0)` 隐藏 | 能启动，但**数秒至数分钟后静默退出**，且不写任何线索 |
+| 提权进程内 `subprocess.run(控制台程序, capture_output=True)` | **挂起**（无控制台父进程创建控制台子进程的死锁） |
+
+应对：
+- 一律 `show=0`；`subprocess` 必须 **`creationflags=CREATE_NO_WINDOW(0x08000000)` + `stdin=subprocess.DEVNULL` + 输出重定向到文件（不用 PIPE）+ 显式 `timeout`**。
+- 提权进程会被**中途回收**，因此**每个关键步骤立刻 `log()` 落盘**（每条 log 单独 open/append/close，不攒缓冲）；**长步骤（DISM 等）一执行完就马上写结果行**，否则进程消失后结果无从取证（本次 DISM 实际成功释放 2.2 GB，但结果行没写出来）。
+- 提权进程的 **`stderr` 也重定向到文件**，否则未捕获异常的 traceback 会随无控制台一起丢失。
+- 与之相对，**注册表/系统级操作不受 safe-delete 影响**（`powercfg /h off` 实测干净释放 6.26 GB）——这是唯一能一步到位释放空间的手段，优先用。
+
+**③ 遍历统计必须跳过重解析点**
+
+`C:\Users\<user>\AppData` 下可能有**数百个目录联接**指向其他盘（本机 560 个）。`os.walk` 统计大小必须剔除，否则链接目标的数据被重复计入：
+
+```python
+import os, stat
+def is_reparse(p):
+    st = os.lstat(p)
+    return bool(st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+```
+
+否则会得出"Docker 11.92 GB、Docker.backup 也 11.92 GB"这类**虚高结论**。
+
+**④ 从回收站还原文件时，目标已存在不要自动改名**
+
+按原路径还原时若目标已存在，**不要静默生成 `xxx_还原1.docx` 这类副本**——本次因此产生两个 6 MB 冗余文件需二次清理。正确做法是先列出"已存在"清单交用户确认，或直接跳过并报告。
+
 ## 六、汇报要求
 
 向用户汇报时给出**前后对照表**（版本、目录占用、注册表关键值、磁盘可用空间），明确区分"已验证"与"仅推断"，并列出仍需用户实测的项。涉及提权的步骤必须写清"需要你点哪一下、点慢会怎样"。
@@ -195,6 +283,141 @@ print(buf.value)    # 映像完整路径
 - 想验证错误路径，**传一个不存在的对象名**是最安全的做法（能证明"明确报错"而非"静默返回垃圾"）。
 - 现成脚本：`scripts/mcp_stdio_smoke.py`。
 
+## 九、大型 IDE 静默安装（以 Visual Studio 为例）
+
+VS 的静默安装有几个会直接导致"进程闪现即退、日志却看不出错"的硬约束（2026-09-28 实测）：
+
+1. **`--installPath` 必须是空目录或不存在。** 只要该目录下有**任何**内容（哪怕只是一个预建的空 `shared` 子目录），安装器会在约 10 秒内以 **exit code 1** 退出，日志只留一行 `Warning: Visual Studio 无法安装到非空目录"..."`。**不要预创建安装目录**。
+2. **`--path shared=` 必须落在 installPath 之外**，否则等于往安装目录里塞东西，直接触发上一条。
+3. `--path cache=` / `--path shared=` **只能在首次安装时设置**，之后不可更改。
+4. **安装器组件强制装在 `C:\Program Files (x86)\Microsoft Visual Studio\Installer`**，无法转移到其他盘。规划空间时必须把它算进 C 盘。
+5. **提权发起进程必须常驻。** 用 `run_in_background=true` 启动，并让脚本自己轮询到安装结束。前台命令一结束，它拉起的提权进程树会被回收——表现为安装器启动 5~60 秒后无声消失，而日志恰好停在某个下载动作上，**极易被误判成网络问题**（本任务就这样连踩两次）。
+6. UAC 弹窗只在发起瞬间有效，120 秒不点即超时。`ShellExecuteW(runas)` 返回 >32 只代表"成功拉起"，**不代表用户已同意**；要判断是否真的启动，应在数秒后查进程。
+
+### 命令模板
+
+```
+vs_Community.exe --installPath "E:\DevTools\Visual Studio" \
+  --path shared="E:\DevTools\Visual Studio Shared" \
+  --path cache="D:\VSCache" \
+  --add Microsoft.VisualStudio.Workload.NativeDesktop \
+  --add Microsoft.VisualStudio.Workload.ManagedDesktop \
+  --includeRecommended --addProductLang zh-CN --quiet --wait --norestart
+```
+
+### 日志定位（失败时的第一现场）
+
+| 文件 | 内容 |
+|---|---|
+| `%TEMP%\dd_bootstrapper_*.log` | 引导程序流程，**末尾写 `VS setup process exited with code N`** |
+| `%TEMP%\dd_installer_*.log` | 安装器主日志，**具体失败原因（如"无法安装到非空目录"）在这里** |
+| `%TEMP%\dd_setup_*.log` / `dd_setup_*_errors.log` | 真正的安装阶段日志与错误专档 |
+
+拿官方引导程序直链的可靠方式：`winget show Microsoft.VisualStudio.Community --source winget`（给出 URL + SHA256）。注意 2026 版包 ID **不含年份**：`Microsoft.VisualStudio.Community` 就是 VS 2026 Community；VS 2022 才是 `Microsoft.VisualStudio.2022.Community`。
+
+### 顺带：判断"某进程是否在跑"
+
+本机 `tasklist` 在沙箱内可能**整体返回 0 行**（并非真的没有进程）。改用 Toolhelp32 快照：
+
+```python
+snap = ctypes.windll.kernel32.CreateToolhelp32Snapshot(0x2, 0)
+pe = PROCESSENTRY32W(); pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+ok = ctypes.windll.kernel32.Process32FirstW(snap, ctypes.byref(pe))
+while ok:
+    ...  # pe.szExeFile / pe.th32ProcessID
+    ok = ctypes.windll.kernel32.Process32NextW(snap, ctypes.byref(pe))
+```
+
+### 安装后置必查：桌面快捷方式（十有八九会缺）
+
+静默装完大型 IDE 后**一定要主动检查**，否则用户第一句话就是"为什么没有桌面快捷方式"：
+
+| 工具 | 默认行为 |
+|---|---|
+| Visual Studio（2019 及以后） | **安装器不创建桌面快捷方式**，只建开始菜单项（微软设计变更，不是故障） |
+| VS Code（Inno Setup） | 安装界面有"创建桌面快捷方式"勾选项，**静默安装默认不勾** |
+
+**最省事的补法**：从开始菜单**复制**现成 `.lnk` 到桌面——图标 / AppUserModelID / 启动参数全部原样保留，比用 `WScript.Shell.CreateShortcut` 重建更完整。
+
+```python
+import shutil, os
+shutil.copy2(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Visual Studio.lnk",
+             os.path.join(user_desktop, "Visual Studio 2026.lnk"))
+```
+
+**先确认真实桌面路径**，本机桌面被重定向（`HKCU\...\Explorer\User Shell Folders` 的 `Desktop = E:\Desktop`）。注意 **`Common Desktop` 在 HKLM 下、通常未重定向**（`C:\Users\Public\Desktop`），它与用户桌面在资源管理器里**合并显示**——判断"用户能不能看到某个图标"时两个目录都要看。
+
+## 十、MSI "源缺失"弹窗（The feature you are trying to use is on a network resource that is unavailable）
+
+**现象**：装大型套件（VS / Windows SDK / ADK）时中途弹框，索要某个 `.msi`（如 `WPTx64-x86_en-us.msi`），"Use source" 里**自动带出一个早已卸载的软件目录**（如 `F:\CAD2025\CAD2025\Setup\3rdParty\WPT\`）。点 OK 无效、反复弹。**这不是本次安装选错路径，是 Windows Installer 的历史遗留登记。**
+
+**根因链条**（2026-09-28 实测）：① 早年某软件（CAD2025）安装时把第三方组件（WPT = Windows Performance Toolkit）一并装进系统，并把 InstallSource 登记为自己安装包的目录；② 该软件删除后目录消失，登记成为**悬空引用**，`C:\Windows\Installer\<hash>.msi` 缓存也可能被 C 盘清理清掉；③ 今天新组件"先移除旧版再装新版"时回头读旧版源 → 找不到 → 弹框。
+
+### 只读诊断（全用 `winreg`，本机 `reg.exe` 被拦截）
+
+| 注册表位置 | 取什么 |
+|---|---|
+| `HKLM\SOFTWARE\Classes\Installer\Products\<packedGuid>` | `ProductName`；`Assignment=1` = 通告态（`UninstallString` 是 `MsiExec /I` 而非 `/X`） |
+| `...\Installer\UserData\S-1-5-18\Products\<packedGuid>\InstallProperties` | `LocalPackage`（缓存 MSI，**常已不存在**）、`InstallSource`（悬空源）、`DisplayVersion`、`ProductCode` |
+| `...\Products\<packedGuid>\SourceList` | `PackageName`（**弹框要的文件名**）、`LastUsedSource` |
+
+`packedGuid` 由 ProductCode 推导：段 1/2/3 各按字节序反转，段 4/5 原样拼（`{06A37890-5602-AC68-…}` → `09873A60206586CA…`）。**反向换算极易写错——直接从注册表 `UninstallString` 读 ProductCode 更稳。**
+
+### 候选源是否可用：只认 ProductCode 精确相等
+
+Windows Installer **不按文件名匹配**。用 `MsiOpenDatabaseW(path, ctypes.c_void_p(0), &h)` 打开候选 MSI，读 `Property` 表的 `ProductCode` 比对，不等就一定会被拒（同产品线的不同修订版 ProductCode 也不同）。
+
+> `MsiRecordGetStringW` 读属性时，先传 `None` 取长度 `n`，缓冲要开 **`n + 2`**；开 `n + 1` 会**稳定少读最后一个字符**（表现为 `WPTx64` 读成 `WPTx6`、`1033` 读成 `103`），足以误判 ProductCode。另注意 `MsiViewExecute` / `MsiViewFetch` **没有 W 后缀**。
+
+### 官方替代源的寻找捷径
+
+SDK/ADK 的 payload 就在 `winsdksetup.exe` 的同一 CDN 目录下：
+
+```
+https://download.microsoft.com/download/<id>/windowssdk/winsdksetup.exe        # 安装器本体
+https://download.microsoft.com/download/<id>/windowssdk/Installers/<name>.msi  # 目录内单个 MSI
+```
+
+`<id>` 从 fwlink 的 302 Location 拿：`curl -sIL https://go.microsoft.com/fwlink/?linkid=2120843`。**但 CDN 只保留该分支的最新修订版**（实测 SDK 2004 只剩 `10.1.19041.68xx`，系统登记的是初版 `10.1.19041.1`），此时仍不匹配——不要在这条路上耗太久。
+
+### 关掉这个"卡死"的弹窗
+
+- 弹窗属于**提权进程**。普通权限 `PostMessage` 返回 `False` 且 `GetLastError()==5`（UIPI 拦截）→ 必须自提权（`ShellExecuteW(None,'runas',sys.executable,自身路径,...)` 重启自己，结果写日志文件回读）。
+- 提权后 `PostMessage(button, BM_CLICK)` **会返回成功但窗口纹丝不动**（目标线程在等待中不泵消息队列）。改用 **`SendMessageTimeoutW(button, BM_CLICK, 0, 0, SMTO_ABORTIFHUNG=0x2, 5000, &res)` 同步发送——实测一次生效**。
+- 兜底：按 Toolhelp32 父子关系收集该窗口 PID 的整棵子树后 `TerminateProcess`（**务必排除 VS 安装器自身的 PID**）。
+
+### 后果可控，放心跳过
+
+取消可选组件后，VS 安装器只记一条失败记录并**继续**后续包，最终进入 NGEN 收尾。实测 WPT 返回 `0x6b2 = 1714`（旧版无法移除）。**WPT（WPR/WPA 性能分析工具）与 C++/.NET 开发无关**，只是 `--includeRecommended` 自动带上的，可安全跳过。
+
+## 十一、网页自动化：用 Edge + CDP 补上缺失的浏览器工具链
+
+本机**没有** `agent-browser`，也没有 `playwright` / `puppeteer`，Python 侧连 `websocket` 库都装不上（镜像源可能不可达）。但网页截图 / 抓取 / 交互并非无路可走：
+
+- **Node 22 起内置全局 `WebSocket`**，不需要任何 `npm install`；
+- **Edge 自带 CDP**，`--remote-debugging-port` 就能开。
+
+两者组合足以完成导航、执行 JS、等待条件、截图。封装脚本：`scripts/edge_cdp.js`。
+
+```bash
+# 启动 headless Edge → 导航 → 等目标文字出现 → 截图
+node scripts/edge_cdp.js --launch --url https://example.com --wait "results" --shot out.png
+
+# 先查明页面结构（按钮 / 输入框 / 可见文字），再决定选择器
+node scripts/edge_cdp.js --probe
+
+# 抓取某个值
+node scripts/edge_cdp.js --eval "document.title"
+```
+
+**要点**：
+- **必须用独立的 `--user-data-dir` 启动**，否则会干扰用户正在使用的浏览器；结束时用 CDP 的 `Browser.close` 收尾，**不要** `taskkill /IM msedge.exe`（那会把用户的窗口一并杀掉）。
+- **AI 生成型页面要等"确定性文字"再截图**。实测 GitDiagram 的架构图由后端流式生成，早截图只能拿到 `Waiting for an update` 这类中间态；用 `--wait "connections"` 之类的锚点判断完成。
+- **不要用 `--virtual-time-budget`**：它会加速虚拟时间、在一次网络往返尚未完成时就触发截图，得到的仍是中间态。要用 `--wait` 做真实轮询。
+- 一次性 `--screenshot` 参数无法交互。**需要点击时必须走 CDP**，用 `Runtime.evaluate` 执行 `el.click()`。
+- 排错顺序：`--probe` 看结构 → `--eval` 验证选择器 → 最后才截图。
+- `Emulation.setDeviceMetricsOverride` + `captureBeyondViewport: true` 才能截到视口之外的完整长页。
+
 ## 参考资源
 
 - `references/wps-office-repair.md` —— WPS Office "功能模块异常 / 点击即提示重新加载" 的完整诊断与修复案例，含根因模式、官方命令、覆盖安装流程。
@@ -202,3 +425,4 @@ print(buf.value)    # 映像完整路径
 - `scripts/check_pending_delete.py` —— **只读**核查 `PendingFileRenameOperations` 登记清单：列出全部"重启后删除/重命名"项、区分"目标仍存在"与"已被处理过"、去重统计重启实际可释放空间。删文件反复失败时先跑它排除 pending-delete。支持 `--json` / `--grep <关键字>`。
 - `scripts/replace_locked_files.py` —— **零中断替换**被运行中进程占用的产物：先按 MD5 比对新旧目录只挑出真正变化的文件，再用"重命名旧文件 + 复制新文件"的方式落地，无需终止进程；支持 `--dry-run` / `--apply` / `--rollback`。
 - `scripts/mcp_stdio_smoke.py` —— MCP stdio 服务冒烟测试：拉起服务进程走 handshake 并列出工具清单，默认零业务副作用；可选 `--call` 调用单个工具（需自行评估副作用）。
+- `scripts/edge_cdp.js` —— 用 Edge + CDP 做网页自动化（导航 / 执行 JS / 探测页面结构 / 等待条件 / 全页截图），零第三方依赖，仅靠 Node 内置 WebSocket。
