@@ -30,12 +30,18 @@
  *   --shot <path>    截图（captureBeyondViewport，含视口外内容）
  *   --eval <js>      执行 JS 并打印返回值
  *   --probe          打印页面标题、按钮、输入框、可见文字（排查选择器用）
+ *   --click <text>   点击文字包含该串的按钮/链接（在 --wait 之前执行）。
+ *                    用于「页面已有缓存内容，需先点『重新生成』再等新结果」的场景
  *   --wait <text>    轮询等待 document.body.innerText 含该文本
  *   --timeout <s>    等待超时秒数，默认 120
  *   --width/--height 视口尺寸，默认 1680x1500
  *   --port <n>       CDP 端口，默认 9222
  *   --launch         若实例未运行则自动启动 Edge
  *   --headed         有头模式启动（默认 headless=new）
+ *   --proxy <url>    显式指定代理（如 http://127.0.0.1:2970）。不指定时自动采用
+ *                    环境变量 http_proxy / HTTPS_PROXY；Edge 默认走**系统代理**，
+ *                    本机系统代理指向不可用的 `[::1]:12334`，会导致 ERR_TIMED_OUT
+ *   --no-proxy       完全不使用代理
  *   --close          执行完关闭浏览器
  *
  * 注意
@@ -62,6 +68,16 @@ const PORT = parseInt(arg('--port', '9222'), 10);
 const WIDTH = parseInt(arg('--width', '1680'), 10);
 const HEIGHT = parseInt(arg('--height', '1500'), 10);
 const TIMEOUT = parseInt(arg('--timeout', '120'), 10);
+// 代理：Edge 启动时默认采用**系统代理**，而本机的系统代理是注册表里那个
+// `http://[::1]:12334`（IPv6 回环），实测浏览器走它连不上外网（ERR_TIMED_OUT），
+// 但命令行 curl 走环境变量代理却通畅——两者不一致就是这个坑的根源。
+// 因此优先用 --proxy 显式指定，否则自动采用环境变量里的代理；--no-proxy 可关闭。
+const PROXY = flag('--no-proxy')
+  ? ''
+  : (arg('--proxy')
+     || process.env.http_proxy || process.env.HTTP_PROXY
+     || process.env.https_proxy || process.env.HTTPS_PROXY
+     || '');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function httpGet(url, timeoutMs = 3000) {
@@ -106,7 +122,9 @@ async function launch(initialUrl) {
     `--user-data-dir=${profile}`,
     `--window-size=${WIDTH},${HEIGHT}`,
   ];
+  if (PROXY) args.push(`--proxy-server=${PROXY}`);
   if (initialUrl) args.push(initialUrl);
+  console.log('[launch] 代理: ' + (PROXY || '（不使用，走 Edge 系统代理设置）'));
   const child = spawn(exe, args, { detached: true, stdio: 'ignore' });
   child.unref();
   for (let i = 0; i < 30; i++) {
@@ -150,6 +168,7 @@ async function connect() {
   const shot = arg('--shot');
   const waitText = arg('--wait');
   const evalExpr = arg('--eval');
+  const clickText = arg('--click');
 
   if (!(await cdpAlive())) {
     if (flag('--launch')) {
@@ -180,6 +199,21 @@ async function connect() {
       if (s === 'complete') break;
       await sleep(500);
     }
+  }
+
+  // 点击：在等待之前先点一次按钮（典型场景——页面上已有缓存内容，
+  // 需要点「重新生成」触发新结果，随后再用 --wait 等新结果出现）。
+  if (clickText) {
+    const r = await c.evalJS(`(() => {
+      const t = ${JSON.stringify(clickText)};
+      const els = [...document.querySelectorAll('button,a,[role="button"]')];
+      const el = els.find((e) => (e.textContent || '').includes(t));
+      if (!el) return 'NOT_FOUND';
+      el.click();
+      return 'CLICKED: ' + (el.textContent || '').trim().slice(0, 40);
+    })()`);
+    console.log('[click] ' + r);
+    await sleep(2500);
   }
 
   if (waitText) {

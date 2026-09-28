@@ -403,18 +403,27 @@ https://download.microsoft.com/download/<id>/windowssdk/Installers/<name>.msi  #
 # 启动 headless Edge → 导航 → 等目标文字出现 → 截图
 node scripts/edge_cdp.js --launch --url https://example.com --wait "results" --shot out.png
 
+# 页面已有缓存内容：先点「重新生成」，再等新内容独有的文字出现
+node scripts/edge_cdp.js --launch --url https://gitdiagram.com/o/r \
+  --click "Regenerate" --wait "edge_cdp" --shot diagram.png
+
 # 先查明页面结构（按钮 / 输入框 / 可见文字），再决定选择器
 node scripts/edge_cdp.js --probe
 
 # 抓取某个值
 node scripts/edge_cdp.js --eval "document.title"
+
+# 代理：自动取环境变量；需要时显式指定
+node scripts/edge_cdp.js --launch --proxy http://127.0.0.1:2970 --url https://example.com --shot o.png
 ```
 
 **要点**：
 - **必须用独立的 `--user-data-dir` 启动**，否则会干扰用户正在使用的浏览器；结束时用 CDP 的 `Browser.close` 收尾，**不要** `taskkill /IM msedge.exe`（那会把用户的窗口一并杀掉）。
-- **AI 生成型页面要等"确定性文字"再截图**。实测 GitDiagram 的架构图由后端流式生成，早截图只能拿到 `Waiting for an update` 这类中间态；用 `--wait "connections"` 之类的锚点判断完成。
+- **必须让浏览器的代理与命令行保持一致**。Edge 启动时默认采用**系统代理**，而本机系统代理是注册表里的 `http://[::1]:12334`（IPv6 回环）——浏览器走它连不上外网（`ERR_TIMED_OUT`），而命令行 `curl` 走环境变量里的代理却 1.5 秒拿到 200。两者不一致，正是"命令能通、浏览器却打不开"的根源。脚本已支持 `--proxy <url>`，未指定时**自动采用环境变量** `http_proxy` / `HTTPS_PROXY`，`--no-proxy` 可关闭。
+- **AI 生成型页面要等"确定性文字"再截图**。实测 GitDiagram 的架构图由后端流式生成，早截图只能拿到 `Waiting for an update` 这类中间态。
+- **页面返回缓存内容时必须先触发重新生成**。实测 GitDiagram 对同一仓库会直接回放缓存图——**判据：新旧 PNG 字节数完全相同**（94,071 = 94,071）。此时用 `--click "Regenerate"` 点掉缓存，再 `--wait <新内容独有的文字>` 等新结果（例如刚新增的文件名 `edge_cdp`）；**不要**等页面共有的文字（如 `connections`，旧图也含，会立刻命中并截回旧图）。
 - **不要用 `--virtual-time-budget`**：它会加速虚拟时间、在一次网络往返尚未完成时就触发截图，得到的仍是中间态。要用 `--wait` 做真实轮询。
-- 一次性 `--screenshot` 参数无法交互。**需要点击时必须走 CDP**，用 `Runtime.evaluate` 执行 `el.click()`。
+- 一次性 `--screenshot` 参数无法交互。**需要点击时必须走 CDP**（脚本已内置 `--click`，内部用 `Runtime.evaluate` 执行 `el.click()`）。
 - 排错顺序：`--probe` 看结构 → `--eval` 验证选择器 → 最后才截图。
 - `Emulation.setDeviceMetricsOverride` + `captureBeyondViewport: true` 才能截到视口之外的完整长页。
 
@@ -425,4 +434,4 @@ node scripts/edge_cdp.js --eval "document.title"
 - `scripts/check_pending_delete.py` —— **只读**核查 `PendingFileRenameOperations` 登记清单：列出全部"重启后删除/重命名"项、区分"目标仍存在"与"已被处理过"、去重统计重启实际可释放空间。删文件反复失败时先跑它排除 pending-delete。支持 `--json` / `--grep <关键字>`。
 - `scripts/replace_locked_files.py` —— **零中断替换**被运行中进程占用的产物：先按 MD5 比对新旧目录只挑出真正变化的文件，再用"重命名旧文件 + 复制新文件"的方式落地，无需终止进程；支持 `--dry-run` / `--apply` / `--rollback`。
 - `scripts/mcp_stdio_smoke.py` —— MCP stdio 服务冒烟测试：拉起服务进程走 handshake 并列出工具清单，默认零业务副作用；可选 `--call` 调用单个工具（需自行评估副作用）。
-- `scripts/edge_cdp.js` —— 用 Edge + CDP 做网页自动化（导航 / 执行 JS / 探测页面结构 / 等待条件 / 全页截图），零第三方依赖，仅靠 Node 内置 WebSocket。
+- `scripts/edge_cdp.js` —— 用 Edge + CDP 做网页自动化（导航 / 执行 JS / 探测页面结构 / 点击按钮 / 等待条件 / 全页截图），零第三方依赖，仅靠 Node 内置 WebSocket。常用参数：`--launch`（自动起 Edge）、`--url`、`--click <文字>`（点按钮，在 `--wait` 之前执行）、`--wait <文字>`、`--shot <路径>`、`--proxy <url>`（不指定则自动取环境变量代理）、`--headed`、`--close`。
