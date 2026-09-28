@@ -1,4 +1,4 @@
-# windows-WPS-ops
+# windows-agent-ops
 
 > 在 Windows 沙箱环境下执行桌面软件诊断、下载、安装、提权、进程与注册表核查时的 Agent 操作规范与避坑清单。
 
@@ -72,15 +72,17 @@
 **用户级安装**（跨项目可用）：
 
 ```bash
-git clone https://github.com/ztc1522021381/windows-WPS-ops.git
-cp -r windows-WPS-ops ~/.workbuddy/skills/windows-agent-ops
+git clone https://github.com/ztc1522021381/windows-agent-ops.git
+mkdir -p ~/.workbuddy/skills
+mv windows-agent-ops ~/.workbuddy/skills/
 ```
 
 **项目级安装**（随项目共享）：
 
 ```bash
-git clone https://github.com/ztc1522021381/windows-WPS-ops.git
-cp -r windows-WPS-ops <你的项目>/.workbuddy/skills/windows-agent-ops
+git clone https://github.com/ztc1522021381/windows-agent-ops.git
+mkdir -p <你的项目>/.workbuddy/skills
+cp -r windows-agent-ops <你的项目>/.workbuddy/skills/
 ```
 
 > 技能目录名需为 `windows-agent-ops`，与 `SKILL.md` 中的 `name` 字段一致。
