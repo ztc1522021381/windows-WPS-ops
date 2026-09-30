@@ -1,6 +1,6 @@
 ---
 name: windows-agent-ops
-description: 在 Windows + WorkBuddy 沙箱环境下对桌面软件做诊断、下载、安装、提权、进程与注册表核查、编译部署、网页自动化，以及发起 HTTP 请求、处理代理、捕获脚本输出、文件落盘、替换被运行中进程锁定的产物时的操作规范与避坑清单。当任务涉及在本机执行 exe 或安装程序、静默安装大型 IDE（如 Visual Studio）、读写注册表、启动 GUI 程序、下载大文件、调用网络 API、采集脚本运行结果、编译或部署本机程序、验证 MCP stdio 服务、用浏览器截图或抓取网页（无 Playwright/Puppeteer 时走 Edge + CDP）、排查桌面软件故障（如 WPS/Office 类应用报错、MSI "源缺失"弹窗）时使用。
+description: 在 Windows + WorkBuddy 沙箱环境下对桌面软件做诊断、下载、安装、提权、进程与注册表核查、编译部署、网页自动化，以及发起 HTTP 请求、处理代理、捕获脚本输出、文件落盘、替换被运行中进程锁定的产物时的操作规范与避坑清单。当任务涉及在本机执行 exe 或安装程序、静默安装大型 IDE（如 Visual Studio）、读写注册表、启动 GUI 程序、下载大文件、调用网络 API、采集脚本运行结果、编译或部署本机程序、验证 MCP stdio 服务、用浏览器截图或抓取网页（无 Playwright/Puppeteer 时走 Edge + CDP）、排查桌面软件故障（如 WPS/Office 类应用报错、MSI "源缺失"弹窗、应用联网失败/代理端口错误）时使用。
 agent_created: true
 ---
 
@@ -206,6 +206,35 @@ def is_reparse(p):
 - **不同域名的可达性不一致，不要用一次失败否定整条链路。** 实测同一会话内 `github.com` 与 `api.github.com` 均返回 200，而 `raw.githubusercontent.com` 读取超时。遇到超时先区分「某个域名不通」与「整体断网」，并**优先改用稳定端点**（例如取文件内容用 `api.github.com` 的 contents 端点，而不是 raw 端点）。
 - 代理由环境变量注入（`http_proxy` / `https_proxy`）。Python `urllib` 默认读取这些变量，无需手工配置；不认环境变量的库需显式传参。
 - HTTP 出站一律**带重试**（退避 3～4 次）。单次超时是常态，不是故障信号，不要因此改写逻辑或放弃任务。
+
+### 桌面应用"联网不佳"：先查残留的死系统代理（2026-09-29 实测，Trae CN 案例）
+
+**症状**：用户报"TRAE CODE 联网不佳"。应用日志里铺满 `net::ERR_PROXY_CONNECTION_FAILED` 与 `Failed to establish a socket connection to proxies: PROXY [::1]:12334`，对 `api.trae.com.cn` 的请求 60 秒超时。**根因确实就是"网络端口错了"——系统代理指向一个没有任何进程监听的死端口。**
+
+**诊断顺序（每步都有判据）**：
+
+1. **先读应用自己的网络日志**。Electron 系应用日志在 `%APPDATA%\<应用>\` 下，如 Trae CN 的 `logs\<时间戳>\network-shared.log` 与 `ahanet\`（字节 tt_net 网络栈，含 `node_race_results`、`hostcache_sync_v1`）。出现 `ERR_PROXY_CONNECTION_FAILED` 即可定性：**是应用在撞一个连不上的代理，不是目标站挂了**。
+2. **查系统代理三件套**（HKCU 可直接读写，无需提权；本机 `reg.exe` 被拦，用 `winreg`）：
+
+   ```python
+   import winreg
+   k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                      r'Software\Microsoft\Windows\CurrentVersion\Internet Settings')
+   for name in ('ProxyEnable', 'ProxyServer', 'AutoConfigURL'):
+       try:
+           print(name, winreg.QueryValueEx(k, name))
+       except FileNotFoundError:
+           print(name, '(未设置)')
+   ```
+
+   实测踩坑值：`ProxyEnable=1` + `ProxyServer=http://[::1]:12334`。**代理地址是 IPv6 回环 `[::1]` 写法**——按"端口错"的直觉去查 `127.0.0.1:12334` 可能查错位置，要按注册表里的原样来。
+3. **验证端口真的死了**：`netstat -ano | findstr :12334` 无任何监听行即坐实"代理进程不在了"（不是代理配置写错，是代理软件根本没在跑）。
+4. **由端口号反推代理软件是谁**：拿端口号到 `%APPDATA%` 各配置目录里 grep。实测 12334 是 **Hiddify** 的默认混合端口（证据：`%APPDATA%\Hiddify\hiddify\current-config.json`）。**代理客户端退出时不清系统代理是通病**——进程没了、注册表残留，于是所有跟随系统代理的应用集体断网，而用户只报最先发现的那一个。
+5. **分清两条代理路径**：Chromium/Electron 应用走 **WinINET 系统代理**；Git Bash 的 curl 只认 `http_proxy` 环境变量、不读系统代理。两条路径不一致时会出现"IDE/浏览器全挂、命令行 curl 秒通"的割裂——这个割裂本身就是把方向指向系统代理的钥匙，**不要被"命令行能通"误导成"网络没问题"**。
+
+**修复**：把 `ProxyEnable` 写回 0（HKCU 直接可写，无需提权）。代理客户端下次启动会自动重新写入系统代理，对它没有影响；但必须**提醒用户在代理软件设置里开"退出时清除系统代理"**，否则必复发。修完让用户**重启出问题的应用**（Electron 不热感知系统代理变化）。另外点破一句：这颗雷炸的范围不止用户报的那一个应用，所有跟随系统代理的软件当时都在断网，修复是一并恢复的。
+
+**修完仍"时快时慢" → 查 CDN 节点黑洞**。对同一域名多次直连测试：实测 `api.trae.com.cn`（字节 DSA CDN）部分节点（`42.236.83.x`、`123.6.180.88`）TCP 直连黑洞超时，另一些（`123.6.122.249`、`123.6.52.173`）0.15 秒即通。两个判据：① 裸路径返回 404 **等于连通**（域名可达、只是没有页面），别把 404 当失败；② 这类间歇性慢是节点质量问题，不是配置错误，**不要顺着它继续改配置**。
 
 ### 路径与临时文件
 
@@ -419,7 +448,7 @@ node scripts/edge_cdp.js --launch --proxy http://127.0.0.1:2970 --url https://ex
 
 **要点**：
 - **必须用独立的 `--user-data-dir` 启动**，否则会干扰用户正在使用的浏览器；结束时用 CDP 的 `Browser.close` 收尾，**不要** `taskkill /IM msedge.exe`（那会把用户的窗口一并杀掉）。
-- **必须让浏览器的代理与命令行保持一致**。Edge 启动时默认采用**系统代理**，而本机系统代理是注册表里的 `http://[::1]:12334`（IPv6 回环）——浏览器走它连不上外网（`ERR_TIMED_OUT`），而命令行 `curl` 走环境变量里的代理却 1.5 秒拿到 200。两者不一致，正是"命令能通、浏览器却打不开"的根源。脚本已支持 `--proxy <url>`，未指定时**自动采用环境变量** `http_proxy` / `HTTPS_PROXY`，`--no-proxy` 可关闭。
+- **必须让浏览器的代理与命令行保持一致**。Edge 启动时默认采用**系统代理**，而本机系统代理是注册表里的 `http://[::1]:12334`（IPv6 回环）——浏览器走它连不上外网（`ERR_TIMED_OUT`），而命令行 `curl` 走环境变量里的代理却 1.5 秒拿到 200。两者不一致，正是"命令能通、浏览器却打不开"的根源。脚本已支持 `--proxy <url>`，未指定时**自动采用环境变量** `http_proxy` / `HTTPS_PROXY`，`--no-proxy` 可关闭。（该死代理即 Hiddify 退出时残留的系统代理，完整排查流程见第七节「桌面应用联网不佳」。）
 - **AI 生成型页面要等"确定性文字"再截图**。实测 GitDiagram 的架构图由后端流式生成，早截图只能拿到 `Waiting for an update` 这类中间态。
 - **页面返回缓存内容时必须先触发重新生成**。实测 GitDiagram 对同一仓库会直接回放缓存图——**判据：新旧 PNG 字节数完全相同**（94,071 = 94,071）。此时用 `--click "Regenerate"` 点掉缓存，再 `--wait <新内容独有的文字>` 等新结果（例如刚新增的文件名 `edge_cdp`）；**不要**等页面共有的文字（如 `connections`，旧图也含，会立刻命中并截回旧图）。
 - **不要用 `--virtual-time-budget`**：它会加速虚拟时间、在一次网络往返尚未完成时就触发截图，得到的仍是中间态。要用 `--wait` 做真实轮询。
